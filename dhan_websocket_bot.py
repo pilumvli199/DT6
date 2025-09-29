@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-# dhan_websocket_bot.py
-# WebSocket + 1-minute poller to ensure Telegram LTP updates
-# Replace WS_URL and ensure DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN are set.
+# dhan_websocket_bot.py (fixed poller diagnostics + retries)
+# Combines websocket listener with a more robust 1-minute poller that:
+# - Retries REST call up to 3 times with backoff
+# - Logs HTTP status and response text when non-200
+# - If payload mapping is empty, attempts to download Dhan instrument CSV to map symbols
+# - Sends a single Telegram error alert on repeated failures and then periodic diagnostics
+# - Keeps the websocket behavior as before
 
 import os
 import time
@@ -15,9 +19,10 @@ try:
 except Exception:
     raise RuntimeError("Missing dependency 'websocket-client'. Install with: pip install websocket-client")
 
+
 # ----------------------------
 # Security ID mapping (sample)
-# Replace or extend with real IDs from Dhan CSV if needed.
+# You should replace or extend these with the real IDs from Dhan CSV.
 # ----------------------------
 INDICES_NSE = {
     "NIFTY 50": "13",
@@ -32,7 +37,6 @@ NIFTY50_STOCKS = {
     "RELIANCE": "2885",
     "TCS": "11536",
 }
-
 def get_security_id(symbol: str):
     s = symbol.upper().strip()
     return NIFTY50_STOCKS.get(s) or INDICES_NSE.get(s) or INDICES_BSE.get(s)
@@ -50,21 +54,16 @@ POLL_INTERVAL = int(os.getenv('POLL_INTERVAL', '60'))   # seconds
 RECONNECT_DELAY = int(os.getenv('RECONNECT_DELAY', '3'))
 HEARTBEAT_INTERVAL = int(os.getenv('HEARTBEAT_INTERVAL', '25'))
 
-# Basic sanity check
-if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    print("ERROR: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set (env). Telegram will not work without them.")
-
-if not CLIENT_ID or not ACCESS_TOKEN:
-    print("WARNING: DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN missing — REST poller and WS auth may fail.")
+INSTRUMENT_CSV_URL = os.getenv('INSTRUMENT_CSV_URL', 'https://images.dhan.co/api-data/api-scrip-master-detailed.csv')
+DHAN_LTP_ENDPOINT = os.getenv('DHAN_LTP_ENDPOINT', 'https://api.dhan.co/v2/marketfeed/ltp')
 
 # ----------------------------
 # Telegram helper
 # ----------------------------
 TELEGRAM_SEND_URL = "https://api.telegram.org/bot{token}/sendMessage"
-
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram not configured, would have sent:", text)
+        print("Telegram not configured, would have sent:\n", text)
         return
     url = TELEGRAM_SEND_URL.format(token=TELEGRAM_BOT_TOKEN)
     payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': text, 'parse_mode': 'HTML'}
@@ -76,64 +75,92 @@ def send_telegram(text: str):
         print("Telegram send error:", e)
 
 # ----------------------------
-# Helpers to build REST payload for /marketfeed/ltp
+# REST poller helpers with retries and diagnostics
 # ----------------------------
-DHAN_LTP_ENDPOINT = "https://api.dhan.co/v2/marketfeed/ltp"
-
 def build_security_payload(symbols):
-    """
-    Returns dict grouped by segment: {'NSE_EQ':[id1,id2], 'NSE_INDEX':[id3]}
-    Uses get_security_id() mapping above.
-    """
     seg_map = {}
     for s in symbols:
         sid = get_security_id(s)
         if not sid:
             print(f"[poller-warn] security id not found for symbol: {s}")
             continue
-        # choose likely segment
         if s.upper() in ('NIFTY','NIFTY 50','BANKNIFTY','NIFTY BANK'):
             seg = 'NSE_INDEX'
         elif s.upper() == 'SENSEX':
             seg = 'BSE_INDEX'
         else:
             seg = 'NSE_EQ'
-        seg_map.setdefault(seg, []).append(int(sid))
+        try:
+            seg_map.setdefault(seg, []).append(int(sid))
+        except Exception:
+            seg_map.setdefault(seg, []).append(sid)
     return seg_map
 
-def call_dhan_ltp(payload):
-    """
-    POST to Dhan LTP endpoint with required headers.
-    Returns parsed JSON or None.
-    """
+def call_dhan_ltp_with_retries(payload, retries=3, backoff=1.5):
     headers = {
         'access-token': ACCESS_TOKEN or '',
         'client-id': CLIENT_ID or '',
         'Accept': 'application/json',
         'Content-Type': 'application/json'
     }
+    last_exc = None
+    for attempt in range(1, retries+1):
+        try:
+            r = requests.post(DHAN_LTP_ENDPOINT, json=payload, headers=headers, timeout=10)
+            # Log status for debugging
+            print(f"[poller] HTTP {r.status_code} (attempt {attempt})")
+            if r.status_code == 200:
+                try:
+                    return r.json()
+                except Exception as e:
+                    print("[poller] JSON decode failed:", e, "response text:", r.text[:500])
+                    return None
+            else:
+                print("[poller] Non-200 response text (truncated):", r.text[:800])
+        except Exception as e:
+            print(f"[poller] exception on attempt {attempt}:", e)
+            last_exc = e
+        time.sleep(backoff * attempt)
+    # All retries failed
+    print("[poller] All retries failed. Last exception:", last_exc)
+    return None
+
+def download_and_build_map(symbols):
+    """Attempt to download instrument CSV and rebuild mapping for missing symbols."""
     try:
-        r = requests.post(DHAN_LTP_ENDPOINT, json=payload, headers=headers, timeout=10)
+        r = requests.get(INSTRUMENT_CSV_URL, timeout=15)
         r.raise_for_status()
-        return r.json()
+        text = r.text.splitlines()
+        # naive CSV parsing - find header and columns for SECURITY_ID and SYMBOL name
+        from csv import DictReader
+        reader = DictReader(text)
+        mapping = {}
+        for row in reader:
+            # try multiple possible name fields
+            symbol_name = row.get('SM_SYMBOL_NAME') or row.get('SYMBOL') or row.get('SYMBOL_NAME') or row.get('TRADING_SYMBOL')
+            sid = row.get('SECURITY_ID') or row.get('SM_INSTRUMENT_ID') or row.get('EXCH_TOKEN')
+            if not symbol_name or not sid:
+                continue
+            mapping[symbol_name.strip().upper()] = sid
+        # try to patch NIFTY50_STOCKS or create a temporary map
+        patched = {}
+        for s in symbols:
+            val = mapping.get(s.strip().upper())
+            if val:
+                patched[s.strip().upper()] = val
+        return patched
     except Exception as e:
-        print("Dhan LTP REST call failed:", e)
-        return None
+        print("[poller] failed to download instrument CSV:", e)
+        return {}
 
 def format_poll_message(json_resp, symbol_map):
-    """
-    Build a readable Telegram message from Dhan LTP response.
-    This logic is defensive and will try common response shapes.
-    """
     now = time.strftime('%Y-%m-%d %H:%M:%S')
     lines = []
     if not json_resp:
         return f"⏱ {now} — Poller: no response from Dhan"
     data = json_resp.get('data') if isinstance(json_resp, dict) else None
     if not data:
-        # maybe flat map
         data = json_resp
-    # Attempt to iterate segments -> ids -> info
     if isinstance(data, dict):
         for seg, bucket in data.items():
             if not isinstance(bucket, dict):
@@ -144,7 +171,6 @@ def format_poll_message(json_resp, symbol_map):
                 ltp = info.get('last_price') or info.get('ltp') or info.get('lastPrice') or info.get('price')
                 if ltp is None:
                     continue
-                # map secid to readable symbol if we can
                 readable = None
                 try:
                     sid_str = str(secid)
@@ -156,43 +182,62 @@ def format_poll_message(json_resp, symbol_map):
                     pass
                 lines.append(f"<b>{readable or secid}</b>  LTP: <code>{ltp}</code>  ({seg})")
     if not lines:
-        return f"⏱ {now} — Poller: response received but no LTP fields found"
-    return f"⏱ {now} — Poller snapshot:\\n" + "\\n".join(lines)
+        return f"⏱ {now} — Poller: response received but no LTP fields found (see logs)"
+    return f"⏱ {now} — Poller snapshot:\n" + "\n".join(lines)
 
 # ----------------------------
-# Poller thread (every POLL_INTERVAL seconds)
+# Poller thread (improved)
 # ----------------------------
 class PollerThread(threading.Thread):
     def __init__(self, symbols, interval=POLL_INTERVAL):
         super().__init__(daemon=True)
         self.symbols = [s.strip() for s in symbols.split(',') if s.strip()]
         self.interval = interval
-        # build a reverse symbol->id map for pretty output
         self.sym_map = {}
         for s in self.symbols:
             sid = get_security_id(s)
             if sid:
                 self.sym_map[s.upper()] = sid
+        self.failed_count = 0
+        self.last_alert_time = 0
 
     def run(self):
         payload_map = build_security_payload(self.symbols)
+        # If mapping is empty, try to download CSV to patch
         if not payload_map:
-            print("[poller] No security IDs mapped — poller will still try if mapping changes.")
+            print("[poller] payload empty, attempting to download instrument CSV and remap...")
+            patched = download_and_build_map(self.symbols)
+            print("[poller] patched mapping from CSV (sample):", dict(list(patched.items())[:10]))
+            # update sym_map and rebuild payload_map
+            for k,v in patched.items():
+                self.sym_map[k.upper()] = v
         while True:
             try:
-                print("[poller] Calling Dhan LTP endpoint with payload:", payload_map)
-                resp = call_dhan_ltp(payload_map)
+                payload_map = build_security_payload(self.symbols)
+                print("[poller] Using payload:", payload_map)
+                resp = call_dhan = call_dhan_ltp_with_retries(payload_map, retries=3)
                 msg = format_poll_message(resp, self.sym_map)
-                send_telegram(msg)
+                # If no response, increment failed counter and send alert only once per 5 failures
+                if resp is None:
+                    self.failed_count += 1
+                    print(f"[poller] failed_count={self.failed_count}")
+                    # send alert every 5 consecutive failures to avoid spamming
+                    if self.failed_count % 5 == 1:
+                        send_telegram(msg + "\n[poller diagnostic] check logs for HTTP status and response text.")
+                else:
+                    # reset counter on success and send normal snapshot
+                    if self.failed_count > 0:
+                        send_telegram(f"⏱ {time.strftime('%Y-%m-%d %H:%M:%S')} — Poller recovered. Sending snapshot now.")
+                        self.failed_count = 0
+                    send_telegram(msg)
             except Exception as e:
                 print("[poller] Exception:", e)
                 traceback.print_exc()
-                # send a small error message to telegram to alert you
-                send_telegram(f"⏱ {time.strftime('%Y-%m-%d %H:%M:%S')} — Poller error: {e}")
+                send_telegram(f"⏱ {time.strftime('%Y-%m-%d %H:%M:%S')} — Poller exception: {e}")
             time.sleep(self.interval)
 
 # ----------------------------
-# WebSocket client (unchanged behavior) - also sends telegram on tick changes
+# WebSocket client (unchanged)
 # ----------------------------
 def build_auth_payload():
     return {
@@ -342,14 +387,12 @@ class DhanWebsocketClient:
             pass
 
 # ----------------------------
-# Launcher: start poller thread then start ws client
+# Launcher
 # ----------------------------
 if __name__ == '__main__':
-    print("Starting Dhan WebSocket + Poller bot. Poll interval (s):", POLL_INTERVAL)
-    # Start poller thread
+    print("Starting Dhan WebSocket + Poller bot (fixed). Poll interval (s):", POLL_INTERVAL)
     poller = PollerThread(SYMBOLS, interval=POLL_INTERVAL)
     poller.start()
-    # Start websocket client in main thread (Railway process keeps running)
     client = DhanWebsocketClient(WS_URL, SYMBOLS)
     try:
         client.run_forever()
