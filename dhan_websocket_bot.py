@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
 # dhan_websocket_bot.py (fixed poller diagnostics + retries)
-# Combines websocket listener with a more robust 1-minute poller that:
-# - Retries REST call up to 3 times with backoff
-# - Logs HTTP status and response text when non-200
-# - If payload mapping is empty, attempts to download Dhan instrument CSV to map symbols
-# - Sends a single Telegram error alert on repeated failures and then periodic diagnostics
-# - Keeps the websocket behavior as before
-
 import os
 import time
 import json
@@ -19,11 +12,8 @@ try:
 except Exception:
     raise RuntimeError("Missing dependency 'websocket-client'. Install with: pip install websocket-client")
 
-
 # ----------------------------
 # Security ID mapping (sample)
-# You should replace or extend these with the real IDs from Dhan CSV.
-# ----------------------------
 INDICES_NSE = {
     "NIFTY 50": "13",
     "NIFTY BANK": "25",
@@ -43,7 +33,6 @@ def get_security_id(symbol: str):
 
 # ----------------------------
 # Config (from env)
-# ----------------------------
 CLIENT_ID = os.getenv('DHAN_CLIENT_ID')
 ACCESS_TOKEN = os.getenv('DHAN_ACCESS_TOKEN')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -59,7 +48,6 @@ DHAN_LTP_ENDPOINT = os.getenv('DHAN_LTP_ENDPOINT', 'https://api.dhan.co/v2/marke
 
 # ----------------------------
 # Telegram helper
-# ----------------------------
 TELEGRAM_SEND_URL = "https://api.telegram.org/bot{token}/sendMessage"
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -76,7 +64,6 @@ def send_telegram(text: str):
 
 # ----------------------------
 # REST poller helpers with retries and diagnostics
-# ----------------------------
 def build_security_payload(symbols):
     seg_map = {}
     for s in symbols:
@@ -107,7 +94,6 @@ def call_dhan_ltp_with_retries(payload, retries=3, backoff=1.5):
     for attempt in range(1, retries+1):
         try:
             r = requests.post(DHAN_LTP_ENDPOINT, json=payload, headers=headers, timeout=10)
-            # Log status for debugging
             print(f"[poller] HTTP {r.status_code} (attempt {attempt})")
             if r.status_code == 200:
                 try:
@@ -121,28 +107,23 @@ def call_dhan_ltp_with_retries(payload, retries=3, backoff=1.5):
             print(f"[poller] exception on attempt {attempt}:", e)
             last_exc = e
         time.sleep(backoff * attempt)
-    # All retries failed
     print("[poller] All retries failed. Last exception:", last_exc)
     return None
 
 def download_and_build_map(symbols):
-    """Attempt to download instrument CSV and rebuild mapping for missing symbols."""
     try:
         r = requests.get(INSTRUMENT_CSV_URL, timeout=15)
         r.raise_for_status()
         text = r.text.splitlines()
-        # naive CSV parsing - find header and columns for SECURITY_ID and SYMBOL name
         from csv import DictReader
         reader = DictReader(text)
         mapping = {}
         for row in reader:
-            # try multiple possible name fields
             symbol_name = row.get('SM_SYMBOL_NAME') or row.get('SYMBOL') or row.get('SYMBOL_NAME') or row.get('TRADING_SYMBOL')
             sid = row.get('SECURITY_ID') or row.get('SM_INSTRUMENT_ID') or row.get('EXCH_TOKEN')
             if not symbol_name or not sid:
                 continue
             mapping[symbol_name.strip().upper()] = sid
-        # try to patch NIFTY50_STOCKS or create a temporary map
         patched = {}
         for s in symbols:
             val = mapping.get(s.strip().upper())
@@ -187,7 +168,6 @@ def format_poll_message(json_resp, symbol_map):
 
 # ----------------------------
 # Poller thread (improved)
-# ----------------------------
 class PollerThread(threading.Thread):
     def __init__(self, symbols, interval=POLL_INTERVAL):
         super().__init__(daemon=True)
@@ -203,29 +183,24 @@ class PollerThread(threading.Thread):
 
     def run(self):
         payload_map = build_security_payload(self.symbols)
-        # If mapping is empty, try to download CSV to patch
         if not payload_map:
             print("[poller] payload empty, attempting to download instrument CSV and remap...")
             patched = download_and_build_map(self.symbols)
             print("[poller] patched mapping from CSV (sample):", dict(list(patched.items())[:10]))
-            # update sym_map and rebuild payload_map
             for k,v in patched.items():
                 self.sym_map[k.upper()] = v
         while True:
             try:
                 payload_map = build_security_payload(self.symbols)
                 print("[poller] Using payload:", payload_map)
-                resp = call_dhan = call_dhan_ltp_with_retries(payload_map, retries=3)
+                resp = call_dhan_ltp_with_retries(payload_map, retries=3)
                 msg = format_poll_message(resp, self.sym_map)
-                # If no response, increment failed counter and send alert only once per 5 failures
                 if resp is None:
                     self.failed_count += 1
                     print(f"[poller] failed_count={self.failed_count}")
-                    # send alert every 5 consecutive failures to avoid spamming
                     if self.failed_count % 5 == 1:
                         send_telegram(msg + "\n[poller diagnostic] check logs for HTTP status and response text.")
                 else:
-                    # reset counter on success and send normal snapshot
                     if self.failed_count > 0:
                         send_telegram(f"⏱ {time.strftime('%Y-%m-%d %H:%M:%S')} — Poller recovered. Sending snapshot now.")
                         self.failed_count = 0
@@ -238,7 +213,6 @@ class PollerThread(threading.Thread):
 
 # ----------------------------
 # WebSocket client (unchanged)
-# ----------------------------
 def build_auth_payload():
     return {
         'action': 'auth',
@@ -386,8 +360,6 @@ class DhanWebsocketClient:
         except Exception:
             pass
 
-# ----------------------------
-# Launcher
 # ----------------------------
 if __name__ == '__main__':
     print("Starting Dhan WebSocket + Poller bot (fixed). Poll interval (s):", POLL_INTERVAL)
