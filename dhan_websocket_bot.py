@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
-# dhan_websocket_bot.py (updated: poller diagnostics + retries -> sends diagnostics to Telegram)
-# Use: set env vars on Railway: DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, WS_URL, SYMBOLS
+# dhan_websocket_bot.py
+# Robust WebSocket + Poller bot for Dhan -> Telegram
+# - Strips env tokens to avoid whitespace errors
+# - Fail-fast on HTTP 401 (invalid access token) and sends diagnostic to Telegram
+# - Sends a startup test Telegram message
+# - Poller retries for transient errors but not for 401
 
 import os
 import time
@@ -15,8 +19,7 @@ except Exception:
     raise RuntimeError("Missing dependency 'websocket-client'. Install with: pip install websocket-client")
 
 # ----------------------------
-# Security ID mapping (sample) - replace/extend with exact ids from Dhan CSV if you have them
-# ----------------------------
+# Security ID mapping (sample) - extend if you want
 INDICES_NSE = {
     "NIFTY 50": "13",
     "NIFTY BANK": "25",
@@ -30,35 +33,32 @@ NIFTY50_STOCKS = {
     "RELIANCE": "2885",
     "TCS": "11536",
 }
-
 def get_security_id(symbol: str):
     s = symbol.upper().strip()
     return NIFTY50_STOCKS.get(s) or INDICES_NSE.get(s) or INDICES_BSE.get(s)
 
 # ----------------------------
-# Config (from env)
-# ----------------------------
-CLIENT_ID = os.getenv('DHAN_CLIENT_ID')
-ACCESS_TOKEN = os.getenv('DHAN_ACCESS_TOKEN')
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-WS_URL = os.getenv('WS_URL', 'wss://dhan.websocket.placeholder/marketfeed')
-SYMBOLS = os.getenv('SYMBOLS', 'NIFTY,BANKNIFTY,SENSEX,RELIANCE,TCS,TATAMOTORS')
-POLL_INTERVAL = int(os.getenv('POLL_INTERVAL', '60'))   # seconds
-RECONNECT_DELAY = int(os.getenv('RECONNECT_DELAY', '3'))
-HEARTBEAT_INTERVAL = int(os.getenv('HEARTBEAT_INTERVAL', '25'))
+# Config (from env) - strip whitespace to avoid paste errors
+CLIENT_ID = (os.getenv('DHAN_CLIENT_ID') or "").strip()
+ACCESS_TOKEN = (os.getenv('DHAN_ACCESS_TOKEN') or "").strip()
+TELEGRAM_BOT_TOKEN = (os.getenv('TELEGRAM_BOT_TOKEN') or "").strip()
+TELEGRAM_CHAT_ID = (os.getenv('TELEGRAM_CHAT_ID') or "").strip()
+WS_URL = (os.getenv('WS_URL') or "wss://dhan.websocket.placeholder/marketfeed").strip()
+SYMBOLS = (os.getenv('SYMBOLS') or "NIFTY,BANKNIFTY,SENSEX,RELIANCE,TCS,TATAMOTORS").strip()
+POLL_INTERVAL = int(os.getenv('POLL_INTERVAL') or 60)   # seconds
+RECONNECT_DELAY = int(os.getenv('RECONNECT_DELAY') or 3)
+HEARTBEAT_INTERVAL = int(os.getenv('HEARTBEAT_INTERVAL') or 25)
 
-INSTRUMENT_CSV_URL = os.getenv('INSTRUMENT_CSV_URL', 'https://images.dhan.co/api-data/api-scrip-master-detailed.csv')
-DHAN_LTP_ENDPOINT = os.getenv('DHAN_LTP_ENDPOINT', 'https://api.dhan.co/v2/marketfeed/ltp')
+INSTRUMENT_CSV_URL = (os.getenv('INSTRUMENT_CSV_URL') or "https://images.dhan.co/api-data/api-scrip-master-detailed.csv").strip()
+DHAN_LTP_ENDPOINT = (os.getenv('DHAN_LTP_ENDPOINT') or "https://api.dhan.co/v2/marketfeed/ltp").strip()
 
 # ----------------------------
 # Telegram helper
-# ----------------------------
 TELEGRAM_SEND_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
 def send_telegram(text: str):
     """
-    Send a Telegram message. If Telegram not configured, print to stdout.
+    Send a Telegram message; if Telegram not configured, print to stdout.
     """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram not configured, would have sent:\n", text)
@@ -66,20 +66,21 @@ def send_telegram(text: str):
     url = TELEGRAM_SEND_URL.format(token=TELEGRAM_BOT_TOKEN)
     payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': text, 'parse_mode': 'HTML'}
     try:
-        r = requests.post(url, data=payload, timeout=10)
-        r.raise_for_status()
+        resp = requests.post(url, data=payload, timeout=10)
+        resp.raise_for_status()
         print("Telegram sent")
     except Exception as e:
         print("Telegram send error:", e)
 
+# Send quick startup test message (helps confirm Telegram config)
+try:
+    send_telegram(f"🟢 Dhan bot starting up at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+except Exception:
+    pass
+
 # ----------------------------
-# REST poller helpers with retries and diagnostics
-# ----------------------------
+# REST poller helpers
 def build_security_payload(symbols):
-    """
-    Build payload grouped by segment for Dhan /marketfeed/ltp.
-    Eg: {'NSE_EQ':[11536], 'NSE_INDEX':[13]}
-    """
     seg_map = {}
     for s in symbols:
         sid = get_security_id(s)
@@ -100,8 +101,8 @@ def build_security_payload(symbols):
 
 def call_dhan_ltp_with_retries(payload, retries=3, backoff=1.5):
     """
-    Improved: retries, logs, and sends a short diagnostic message to Telegram on non-200 or exception.
-    Returns parsed JSON on success, otherwise None.
+    Fail-fast on 401 (invalid token). Retry other transient errors up to `retries`.
+    Sends short diagnostics to Telegram on non-200 or exceptions.
     """
     headers = {
         'access-token': ACCESS_TOKEN or '',
@@ -114,25 +115,31 @@ def call_dhan_ltp_with_retries(payload, retries=3, backoff=1.5):
         try:
             r = requests.post(DHAN_LTP_ENDPOINT, json=payload, headers=headers, timeout=12)
             print(f"[poller] HTTP {r.status_code} (attempt {attempt})")
-            # if non-200 -> send diagnostic telegram with truncated body
-            if r.status_code != 200:
+            # 401 = invalid access token — notify and stop retries
+            if r.status_code == 401:
                 snippet = (r.text[:600] + '...') if r.text and len(r.text) > 600 else (r.text or '')
-                diag = ("[poller diagnostic] HTTP {status} (attempt {attempt})\\n"
-                        "Payload: {payload}\\nBody: {body}").format(
-                            status=r.status_code, attempt=attempt,
-                            payload=json.dumps(payload), body=snippet)
+                diag = f"[poller diagnostic] HTTP 401 - Access token invalid. Payload: {json.dumps(payload)}\nBody: {snippet}"
                 try:
                     send_telegram(diag)
-                except Exception as e:
-                    print("[poller] failed to send diagnostic telegram:", e)
-                # continue retrying
+                except Exception:
+                    pass
+                return None
+            # non-200 other status codes: notify, but allow retries
+            if r.status_code != 200:
+                snippet = (r.text[:600] + '...') if r.text and len(r.text) > 600 else (r.text or '')
+                diag = f"[poller diagnostic] HTTP {r.status_code} (attempt {attempt})\nPayload: {json.dumps(payload)}\nBody: {snippet}"
+                try:
+                    send_telegram(diag)
+                except Exception:
+                    pass
+                # continue retrying for transient errors
             else:
-                # try parse json
+                # 200: try parse JSON
                 try:
                     return r.json()
                 except Exception as e:
                     snippet = (r.text[:800] + '...') if r.text and len(r.text) > 800 else (r.text or '')
-                    diag = f"[poller diagnostic] JSON decode failed: {e}\nStatus: 200\nBody: {snippet}"
+                    diag = f"[poller diagnostic] JSON decode failed: {e}\nBody: {snippet}"
                     try:
                         send_telegram(diag)
                     except Exception:
@@ -141,7 +148,6 @@ def call_dhan_ltp_with_retries(payload, retries=3, backoff=1.5):
         except Exception as e:
             print(f"[poller] exception on attempt {attempt}:", e)
             last_exc = e
-            # send exception text to telegram (truncated)
             try:
                 send_telegram(f"[poller diagnostic] Exception on attempt {attempt}: {str(e)[:400]}")
             except Exception:
@@ -156,10 +162,6 @@ def call_dhan_ltp_with_retries(payload, retries=3, backoff=1.5):
     return None
 
 def download_and_build_map(symbols):
-    """
-    Attempt to download instrument CSV and return a small mapping {SYMBOL: SECURITY_ID}
-    This is a best-effort fallback if your hardcoded map is incomplete.
-    """
     try:
         r = requests.get(INSTRUMENT_CSV_URL, timeout=15)
         r.raise_for_status()
@@ -184,9 +186,6 @@ def download_and_build_map(symbols):
         return {}
 
 def format_poll_message(json_resp, symbol_map):
-    """
-    Build readable Telegram message from Dhan LTP response (defensive).
-    """
     now = time.strftime('%Y-%m-%d %H:%M:%S')
     lines = []
     if not json_resp:
@@ -219,8 +218,7 @@ def format_poll_message(json_resp, symbol_map):
     return f"⏱ {now} — Poller snapshot:\n" + "\n".join(lines)
 
 # ----------------------------
-# Poller thread (improved)
-# ----------------------------
+# Poller thread
 class PollerThread(threading.Thread):
     def __init__(self, symbols, interval=POLL_INTERVAL):
         super().__init__(daemon=True)
@@ -250,7 +248,6 @@ class PollerThread(threading.Thread):
                 if resp is None:
                     self.failed_count += 1
                     print(f"[poller] failed_count={self.failed_count}")
-                    # send alert every 5 consecutive failures to avoid spamming
                     if self.failed_count % 5 == 1:
                         send_telegram(msg + "\n[poller diagnostic] check logs for HTTP status and response text.")
                 else:
@@ -265,8 +262,7 @@ class PollerThread(threading.Thread):
             time.sleep(self.interval)
 
 # ----------------------------
-# WebSocket client (skeleton)
-# ----------------------------
+# WebSocket skeleton (auth + subscribe placeholders)
 def build_auth_payload():
     return {
         'action': 'auth',
@@ -416,9 +412,8 @@ class DhanWebsocketClient:
 
 # ----------------------------
 # Launcher
-# ----------------------------
 if __name__ == '__main__':
-    print("Starting Dhan WebSocket + Poller bot (updated). Poll interval (s):", POLL_INTERVAL)
+    print("Starting Dhan WebSocket + Poller bot (robust). Poll interval (s):", POLL_INTERVAL)
     poller = PollerThread(SYMBOLS, interval=POLL_INTERVAL)
     poller.start()
     client = DhanWebsocketClient(WS_URL, SYMBOLS)
