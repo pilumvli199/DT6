@@ -1,198 +1,95 @@
 #!/usr/bin/env python3
-# dhan_websocket_bot.py
-# Robust WebSocket + Poller bot for Dhan -> Telegram
-# - Strips env tokens to avoid whitespace errors
-# - Fail-fast on HTTP 401 (invalid access token) and sends diagnostic to Telegram
-# - Sends a startup test Telegram message
-# - Poller retries for transient errors but not for 401
+# dhan_commodity_bot.py
+# WebSocket + 1-min poller for Indian commodity LTP -> Telegram
+# Requirements: websocket-client, requests
 
-import os
-import time
-import json
-import threading
-import traceback
-import requests
-
+import os, time, json, threading, traceback, requests
 try:
     import websocket
 except Exception:
-    raise RuntimeError("Missing dependency 'websocket-client'. Install with: pip install websocket-client")
+    raise RuntimeError("Install websocket-client: pip install websocket-client")
 
-# ----------------------------
-# Security ID mapping (sample) - extend if you want
-INDICES_NSE = {
-    "NIFTY 50": "13",
-    "NIFTY BANK": "25",
-    "BANKNIFTY": "25",
+# ---------------- CONFIG (env) ----------------
+CLIENT_ID = (os.getenv("DHAN_CLIENT_ID") or "").strip()
+ACCESS_TOKEN = (os.getenv("DHAN_ACCESS_TOKEN") or "").strip()
+TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+WS_URL = (os.getenv("WS_URL") or "wss://dhan.websocket.placeholder/marketfeed").strip()
+SYMBOLS = (os.getenv("SYMBOLS") or "GOLD, SILVER, CRUDEOIL").strip()  # comma-separated
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL") or 60)
+
+# Dhan REST endpoint for poller
+DHAN_LTP_ENDPOINT = os.getenv("DHAN_LTP_ENDPOINT") or "https://api.dhan.co/v2/marketfeed/ltp"
+INSTRUMENT_CSV_URL = os.getenv("INSTRUMENT_CSV_URL") or "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
+
+# ---------------- Sample mapping: SYMBOL -> SECURITY_ID ----------------
+# Replace these with exact SECURITY_IDs from Dhan instrument CSV for commodities.
+COMMODITY_IDS = {
+    # sample placeholders — MUST replace with real IDs from CSV
+    "GOLD": "5001",
+    "SILVER": "5002",
+    "CRUDEOIL": "5003",
+    "NATGAS": "5004",
 }
-INDICES_BSE = {
-    "SENSEX": "51",
-}
-NIFTY50_STOCKS = {
-    "TATAMOTORS": "3456",
-    "RELIANCE": "2885",
-    "TCS": "11536",
-}
+
 def get_security_id(symbol: str):
-    s = symbol.upper().strip()
-    return NIFTY50_STOCKS.get(s) or INDICES_NSE.get(s) or INDICES_BSE.get(s)
+    return COMMODITY_IDS.get(symbol.upper())
 
-# ----------------------------
-# Config (from env) - strip whitespace to avoid paste errors
-CLIENT_ID = (os.getenv('DHAN_CLIENT_ID') or "").strip()
-ACCESS_TOKEN = (os.getenv('DHAN_ACCESS_TOKEN') or "").strip()
-TELEGRAM_BOT_TOKEN = (os.getenv('TELEGRAM_BOT_TOKEN') or "").strip()
-TELEGRAM_CHAT_ID = (os.getenv('TELEGRAM_CHAT_ID') or "").strip()
-WS_URL = (os.getenv('WS_URL') or "wss://dhan.websocket.placeholder/marketfeed").strip()
-SYMBOLS = (os.getenv('SYMBOLS') or "NIFTY,BANKNIFTY,SENSEX,RELIANCE,TCS,TATAMOTORS").strip()
-POLL_INTERVAL = int(os.getenv('POLL_INTERVAL') or 60)   # seconds
-RECONNECT_DELAY = int(os.getenv('RECONNECT_DELAY') or 3)
-HEARTBEAT_INTERVAL = int(os.getenv('HEARTBEAT_INTERVAL') or 25)
-
-INSTRUMENT_CSV_URL = (os.getenv('INSTRUMENT_CSV_URL') or "https://images.dhan.co/api-data/api-scrip-master-detailed.csv").strip()
-DHAN_LTP_ENDPOINT = (os.getenv('DHAN_LTP_ENDPOINT') or "https://api.dhan.co/v2/marketfeed/ltp").strip()
-
-# ----------------------------
-# Telegram helper
+# ---------------- Telegram helper ----------------
 TELEGRAM_SEND_URL = "https://api.telegram.org/bot{token}/sendMessage"
-
 def send_telegram(text: str):
-    """
-    Send a Telegram message; if Telegram not configured, print to stdout.
-    """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram not configured, would have sent:\n", text)
+        print("[telegram skipped]", text)
         return
-    url = TELEGRAM_SEND_URL.format(token=TELEGRAM_BOT_TOKEN)
-    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': text, 'parse_mode': 'HTML'}
     try:
-        resp = requests.post(url, data=payload, timeout=10)
-        resp.raise_for_status()
-        print("Telegram sent")
+        r = requests.post(TELEGRAM_SEND_URL.format(token=TELEGRAM_BOT_TOKEN),
+                          data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
+        r.raise_for_status()
     except Exception as e:
         print("Telegram send error:", e)
 
-# Send quick startup test message (helps confirm Telegram config)
-try:
-    send_telegram(f"🟢 Dhan bot starting up at {time.strftime('%Y-%m-%d %H:%M:%S')}")
-except Exception:
-    pass
-
-# ----------------------------
-# REST poller helpers
-def build_security_payload(symbols):
+# ---------------- Poller (1-min snapshot) ----------------
+def build_payload_for_poll(symbols):
+    """Return payload grouped by segment. We guess segment as 'MCX' -> use 'NSE_EQ' or provider-expected keys.
+    Replace seg key if Dhan expects other segment names for commodities."""
     seg_map = {}
     for s in symbols:
         sid = get_security_id(s)
         if not sid:
-            print(f"[poller-warn] security id not found for symbol: {s}")
+            print("[poller-warn] security id missing for", s)
             continue
-        if s.upper() in ('NIFTY','NIFTY 50','BANKNIFTY','NIFTY BANK'):
-            seg = 'NSE_INDEX'
-        elif s.upper() == 'SENSEX':
-            seg = 'BSE_INDEX'
-        else:
-            seg = 'NSE_EQ'
-        try:
-            seg_map.setdefault(seg, []).append(int(sid))
-        except Exception:
-            seg_map.setdefault(seg, []).append(sid)
+        # Using generic segment key - adjust if Dhan requires specific e.g. 'MCX_COMMODITY' etc.
+        seg = 'NSE_EQ'
+        seg_map.setdefault(seg, []).append(int(sid) if str(sid).isdigit() else sid)
     return seg_map
 
-def call_dhan_ltp_with_retries(payload, retries=3, backoff=1.5):
-    """
-    Fail-fast on 401 (invalid token). Retry other transient errors up to `retries`.
-    Sends short diagnostics to Telegram on non-200 or exceptions.
-    """
-    headers = {
-        'access-token': ACCESS_TOKEN or '',
-        'client-id': CLIENT_ID or '',
-        'Accept': 'application/json',
-        'Content-Type': 'application/json'
-    }
-    last_exc = None
+def call_dhan_ltp(payload, retries=2):
+    headers = {'access-token': ACCESS_TOKEN or '', 'client-id': CLIENT_ID or '', 'Accept': 'application/json', 'Content-Type': 'application/json'}
     for attempt in range(1, retries+1):
         try:
-            r = requests.post(DHAN_LTP_ENDPOINT, json=payload, headers=headers, timeout=12)
-            print(f"[poller] HTTP {r.status_code} (attempt {attempt})")
-            # 401 = invalid access token — notify and stop retries
-            if r.status_code == 401:
-                snippet = (r.text[:600] + '...') if r.text and len(r.text) > 600 else (r.text or '')
-                diag = f"[poller diagnostic] HTTP 401 - Access token invalid. Payload: {json.dumps(payload)}\nBody: {snippet}"
-                try:
-                    send_telegram(diag)
-                except Exception:
-                    pass
-                return None
-            # non-200 other status codes: notify, but allow retries
-            if r.status_code != 200:
-                snippet = (r.text[:600] + '...') if r.text and len(r.text) > 600 else (r.text or '')
-                diag = f"[poller diagnostic] HTTP {r.status_code} (attempt {attempt})\nPayload: {json.dumps(payload)}\nBody: {snippet}"
-                try:
-                    send_telegram(diag)
-                except Exception:
-                    pass
-                # continue retrying for transient errors
-            else:
-                # 200: try parse JSON
+            r = requests.post(DHAN_LTP_ENDPOINT, json=payload, headers=headers, timeout=10)
+            print("[poller] HTTP", r.status_code)
+            if r.status_code == 200:
                 try:
                     return r.json()
                 except Exception as e:
-                    snippet = (r.text[:800] + '...') if r.text and len(r.text) > 800 else (r.text or '')
-                    diag = f"[poller diagnostic] JSON decode failed: {e}\nBody: {snippet}"
-                    try:
-                        send_telegram(diag)
-                    except Exception:
-                        pass
+                    print("JSON parse failed:", e)
                     return None
+            else:
+                # send short diagnostic once
+                send_telegram(f"[poller diagnostic] HTTP {r.status_code} attempt {attempt}\nBody: {r.text[:600]}")
         except Exception as e:
-            print(f"[poller] exception on attempt {attempt}:", e)
-            last_exc = e
-            try:
-                send_telegram(f"[poller diagnostic] Exception on attempt {attempt}: {str(e)[:400]}")
-            except Exception:
-                pass
-        time.sleep(backoff * attempt)
-    # all attempts failed
-    try:
-        send_telegram(f"[poller diagnostic] All {retries} attempts failed. Last exception: {str(last_exc)[:400]}")
-    except Exception:
-        pass
-    print("[poller] All retries failed. Last exception:", last_exc)
+            print("Poller exception:", e)
+        time.sleep(1)
     return None
 
-def download_and_build_map(symbols):
-    try:
-        r = requests.get(INSTRUMENT_CSV_URL, timeout=15)
-        r.raise_for_status()
-        text = r.text.splitlines()
-        from csv import DictReader
-        reader = DictReader(text)
-        mapping = {}
-        for row in reader:
-            symbol_name = row.get('SM_SYMBOL_NAME') or row.get('SYMBOL') or row.get('SYMBOL_NAME') or row.get('TRADING_SYMBOL')
-            sid = row.get('SECURITY_ID') or row.get('SM_INSTRUMENT_ID') or row.get('EXCH_TOKEN')
-            if not symbol_name or not sid:
-                continue
-            mapping[symbol_name.strip().upper()] = sid
-        patched = {}
-        for s in symbols:
-            val = mapping.get(s.strip().upper())
-            if val:
-                patched[s.strip().upper()] = val
-        return patched
-    except Exception as e:
-        print("[poller] failed to download instrument CSV:", e)
-        return {}
-
-def format_poll_message(json_resp, symbol_map):
-    now = time.strftime('%Y-%m-%d %H:%M:%S')
+def format_and_send_poll(resp, symbols):
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    if not resp:
+        send_telegram(f"⏱ {now} — Poller: no response from Dhan")
+        return
+    data = resp.get("data") if isinstance(resp, dict) else resp
     lines = []
-    if not json_resp:
-        return f"⏱ {now} — Poller: no response from Dhan"
-    data = json_resp.get('data') if isinstance(json_resp, dict) else None
-    if not data:
-        data = json_resp
     if isinstance(data, dict):
         for seg, bucket in data.items():
             if not isinstance(bucket, dict):
@@ -201,224 +98,138 @@ def format_poll_message(json_resp, symbol_map):
                 if not isinstance(info, dict):
                     continue
                 ltp = info.get('last_price') or info.get('ltp') or info.get('lastPrice') or info.get('price')
-                if ltp is None:
-                    continue
+                if ltp is None: continue
+                # try map back to symbol
                 readable = None
-                try:
-                    sid_str = str(secid)
-                    for k,v in symbol_map.items():
-                        if str(v) == sid_str:
-                            readable = k
-                            break
-                except Exception:
-                    pass
-                lines.append(f"<b>{readable or secid}</b>  LTP: <code>{ltp}</code>  ({seg})")
-    if not lines:
-        return f"⏱ {now} — Poller: response received but no LTP fields found (see logs)"
-    return f"⏱ {now} — Poller snapshot:\n" + "\n".join(lines)
+                for k,v in COMMODITY_IDS.items():
+                    if str(v) == str(secid):
+                        readable = k; break
+                lines.append(f"<b>{readable or secid}</b> LTP: <code>{ltp}</code> ({seg})")
+    if lines:
+        send_telegram(f"⏱ {now} — Poller snapshot:\n" + "\n".join(lines))
+    else:
+        send_telegram(f"⏱ {now} — Poller: no LTP fields found (see logs)")
 
-# ----------------------------
-# Poller thread
-class PollerThread(threading.Thread):
+class Poller(threading.Thread):
     def __init__(self, symbols, interval=POLL_INTERVAL):
         super().__init__(daemon=True)
-        self.symbols = [s.strip() for s in symbols.split(',') if s.strip()]
+        self.symbols = [s.strip() for s in symbols.split(",") if s.strip()]
         self.interval = interval
-        self.sym_map = {}
-        for s in self.symbols:
-            sid = get_security_id(s)
-            if sid:
-                self.sym_map[s.upper()] = sid
-        self.failed_count = 0
 
     def run(self):
-        payload_map = build_security_payload(self.symbols)
+        # If mapping incomplete, attempt CSV fallback once
+        payload_map = build_payload_for_poll(self.symbols)
         if not payload_map:
-            print("[poller] payload empty, attempting to download instrument CSV and remap...")
-            patched = download_and_build_map(self.symbols)
-            print("[poller] patched mapping from CSV (sample):", dict(list(patched.items())[:10]))
-            for k,v in patched.items():
-                self.sym_map[k.upper()] = v
+            # try download CSV and patch (best-effort)
+            try:
+                r = requests.get(INSTRUMENT_CSV_URL, timeout=10); r.raise_for_status()
+                from csv import DictReader
+                reader = DictReader(r.text.splitlines())
+                csv_map = {}
+                for row in reader:
+                    name = (row.get('SM_SYMBOL_NAME') or row.get('TRADING_SYMBOL') or '').strip().upper()
+                    sid = row.get('SECURITY_ID') or row.get('SM_INSTRUMENT_ID') or row.get('EXCH_TOKEN')
+                    if name and sid: csv_map[name] = sid
+                for s in self.symbols:
+                    found = csv_map.get(s.strip().upper())
+                    if found:
+                        COMMODITY_IDS[s.strip().upper()] = found
+                        print("[poller] patched mapping", s, "->", found)
+            except Exception as e:
+                print("CSV fallback failed:", e)
         while True:
             try:
-                payload_map = build_security_payload(self.symbols)
-                print("[poller] Using payload:", payload_map)
-                resp = call_dhan_ltp_with_retries(payload_map, retries=3)
-                msg = format_poll_message(resp, self.sym_map)
-                if resp is None:
-                    self.failed_count += 1
-                    print(f"[poller] failed_count={self.failed_count}")
-                    if self.failed_count % 5 == 1:
-                        send_telegram(msg + "\n[poller diagnostic] check logs for HTTP status and response text.")
-                else:
-                    if self.failed_count > 0:
-                        send_telegram(f"⏱ {time.strftime('%Y-%m-%d %H:%M:%S')} — Poller recovered. Sending snapshot now.")
-                        self.failed_count = 0
-                    send_telegram(msg)
+                payload = build_payload_for_poll(self.symbols)
+                print("[poller] payload:", payload)
+                resp = call_dhan_ltp(payload)
+                format_and_send_poll(resp, self.symbols)
             except Exception as e:
-                print("[poller] Exception:", e)
-                traceback.print_exc()
-                send_telegram(f"⏱ {time.strftime('%Y-%m-%d %H:%M:%S')} — Poller exception: {e}")
+                print("Poller exception:", e)
             time.sleep(self.interval)
 
-# ----------------------------
-# WebSocket skeleton (auth + subscribe placeholders)
+# ---------------- WebSocket client ----------------
 def build_auth_payload():
-    return {
-        'action': 'auth',
-        'client_id': CLIENT_ID,
-        'access_token': ACCESS_TOKEN,
-    }
+    return {'action':'auth','client_id': CLIENT_ID, 'access_token': ACCESS_TOKEN}
 
-def build_subscribe_msg(security_ids):
-    return {
-        'action': 'subscribe',
-        'instruments': [{'segment': seg, 'instrument_id': sid} for seg, sid in security_ids]
-    }
-
-def build_security_list(symbols):
+def build_subscribe_payload(symbols):
     out = []
     for s in symbols:
         sid = get_security_id(s)
         if not sid:
-            print(f"[ws-warn] security id not found for: {s}")
-            continue
-        if s.upper() in ('NIFTY','NIFTY 50','BANKNIFTY','NIFTY BANK'):
-            seg = 'NSE_INDEX'
-        elif s.upper() == 'SENSEX':
-            seg = 'BSE_INDEX'
-        else:
-            seg = 'NSE_EQ'
-        out.append((seg, str(sid)))
-    return out
+            print("[ws-warn] missing id for", s); continue
+        seg = 'NSE_EQ'
+        out.append({'segment': seg, 'instrument_id': str(sid)})
+    return {'action':'subscribe', 'instruments': out}
 
-class DhanWebsocketClient:
-    def __init__(self, ws_url, symbols):
-        self.ws_url = ws_url
-        self.symbols = [s.strip() for s in symbols.split(',') if s.strip()]
+class DhanWS:
+    def __init__(self, url, symbols):
+        self.url = url
+        self.symbols = [s.strip() for s in symbols.split(",") if s.strip()]
         self.ws = None
-        self._stop = threading.Event()
-        self.last_ltps = {}
+        self.last = {}
 
     def on_open(self, ws):
-        print("WebSocket opened")
-        try:
-            auth = build_auth_payload()
-            if auth:
-                ws.send(json.dumps(auth))
-                print("Auth payload sent")
-            sec_list = build_security_list(self.symbols)
-            if not sec_list:
-                print("No security ids to subscribe to. Check mapping.")
-                return
-            sub = build_subscribe_msg(sec_list)
-            ws.send(json.dumps(sub))
-            print("Subscribe message sent:", sub)
-        except Exception as e:
-            print("Error during on_open actions:", e)
+        print("WS opened - auth")
+        auth = build_auth_payload(); ws.send(json.dumps(auth)); print("Auth sent")
+        sub = build_subscribe_payload(self.symbols); ws.send(json.dumps(sub)); print("Subscribe sent")
 
     def on_message(self, ws, message):
         try:
             if isinstance(message, bytes):
-                try:
-                    message = message.decode('utf-8')
-                except Exception:
-                    print("Received binary message - parser not implemented")
-                    return
+                message = message.decode('utf-8')
             data = json.loads(message)
         except Exception as e:
-            print("Failed to parse incoming message as JSON:", e)
+            print("WS msg parse fail:", e, message[:200])
             return
-
-        ltp = None
-        symbol = None
+        # try many keys for ltp
+        ltp = None; label = None
+        # common shapes: nested data -> seg->{id: {last_price:..}}
         if isinstance(data, dict):
-            payload = data.get('data') if 'data' in data else data
+            payload = data.get('data') or data
             if isinstance(payload, dict):
-                for k, v in payload.items():
-                    if isinstance(v, dict):
-                        for instid, info in v.items():
+                for seg, bucket in payload.items():
+                    if isinstance(bucket, dict):
+                        for instid, info in bucket.items():
                             if isinstance(info, dict):
                                 ltp = info.get('last_price') or info.get('ltp') or info.get('lastPrice')
                                 if ltp is not None:
-                                    symbol = instid
-                                    break
-                        if ltp is not None:
-                            break
+                                    label = instid; break
+                        if ltp is not None: break
             if ltp is None:
-                ltp = data.get('ltp') or data.get('last_price') or data.get('lastPrice') or data.get('price')
-                symbol = data.get('symbol') or data.get('instrument') or symbol
-
+                ltp = data.get('ltp') or data.get('last_price') or data.get('price')
+                label = data.get('symbol') or data.get('instrument') or label
         if ltp is not None:
-            readable = symbol
-            sid = None
-            try:
-                sid = str(symbol)
-                for k, v in NIFTY50_STOCKS.items():
-                    if str(v) == sid:
-                        readable = k
-                        break
-                for k, v in INDICES_NSE.items():
-                    if str(v) == sid:
-                        readable = k
-                        break
-                for k, v in INDICES_BSE.items():
-                    if str(v) == sid:
-                        readable = k
-                        break
-            except Exception:
-                pass
-
-            key = f"{readable}:{sid}" if sid else readable
-            prev = self.last_ltps.get(key)
-            self.last_ltps[key] = ltp
+            # map label -> readable
+            readable = label
+            for k,v in COMMODITY_IDS.items():
+                if str(v) == str(label):
+                    readable = k; break
+            key = f"{readable}:{label}"
+            prev = self.last.get(key)
+            self.last[key] = ltp
             text = f"⏱ {time.strftime('%Y-%m-%d %H:%M:%S')} — <b>{readable}</b> LTP: <code>{ltp}</code>"
             if prev != ltp:
-                send_telegram(text)
-                print("Sent telegram (ws):", text)
+                send_telegram(text); print("Sent ws alert:", text)
 
-    def on_error(self, ws, error):
-        print("WebSocket error:", error)
+    def on_error(self, ws, err): print("WS error:", err)
+    def on_close(self, ws, code, reason): print("WS closed:", code, reason)
 
-    def on_close(self, ws, close_status_code, close_msg):
-        print("WebSocket closed:", close_status_code, close_msg)
+    def run(self):
+        self.ws = websocket.WebSocketApp(self.url,
+                                        on_open=self.on_open,
+                                        on_message=self.on_message,
+                                        on_error=self.on_error,
+                                        on_close=self.on_close,
+                                        header=[f"access-token: {ACCESS_TOKEN}", f"client-id: {CLIENT_ID}"])
+        self.ws.run_forever(ping_interval=25, ping_timeout=10)
 
-    def run_forever(self):
-        while not self._stop.is_set():
-            try:
-                print("Connecting to websocket:", self.ws_url)
-                self.ws = websocket.WebSocketApp(
-                    self.ws_url,
-                    on_open=self.on_open,
-                    on_message=self.on_message,
-                    on_error=self.on_error,
-                    on_close=self.on_close,
-                )
-                self.ws.run_forever(ping_interval=HEARTBEAT_INTERVAL, ping_timeout=10)
-            except Exception as e:
-                print("Exception in run_forever loop:", e)
-                traceback.print_exc()
-            if not self._stop.is_set():
-                print(f"Reconnecting after {RECONNECT_DELAY}s...")
-                time.sleep(RECONNECT_DELAY)
-
-    def stop(self):
-        self._stop.set()
-        try:
-            if self.ws:
-                self.ws.close()
-        except Exception:
-            pass
-
-# ----------------------------
-# Launcher
-if __name__ == '__main__':
-    print("Starting Dhan WebSocket + Poller bot (robust). Poll interval (s):", POLL_INTERVAL)
-    poller = PollerThread(SYMBOLS, interval=POLL_INTERVAL)
+# ---------------- Launcher ----------------
+if __name__ == "__main__":
+    print("Starting commodity bot. Symbols:", SYMBOLS)
+    poller = Poller(SYMBOLS, interval=POLL_INTERVAL)
     poller.start()
-    client = DhanWebsocketClient(WS_URL, SYMBOLS)
+    wsclient = DhanWS(WS_URL, SYMBOLS)
     try:
-        client.run_forever()
+        wsclient.run()
     except KeyboardInterrupt:
-        print("Stopping...")
-        client.stop()
+        print("Exiting")
